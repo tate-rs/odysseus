@@ -55,6 +55,9 @@ class TestDetectProviderRealHosts:
     def test_ollama_native_unchanged(self):
         assert llm_core._detect_provider("https://ollama.com/api") == "ollama"
 
+    def test_chatgpt_codex_subscription(self):
+        assert llm_core._detect_provider("https://chatgpt.com/backend-api/codex") == "codex"
+
     def test_unknown_host_defaults_to_openai(self):
         assert llm_core._detect_provider("https://api.example.com/v1") == "openai"
 
@@ -104,6 +107,9 @@ class TestBuildersRejectLookalikeHosts:
 
     def test_real_ollama_chat(self):
         assert build_chat_url("https://ollama.com") == "https://ollama.com/api/chat"
+
+    def test_chatgpt_codex_subscription_chat_uses_responses(self):
+        assert build_chat_url("https://chatgpt.com/backend-api/codex") == "https://chatgpt.com/backend-api/codex/responses"
 
     def test_lookalike_ollama_chat_is_openai(self):
         assert build_chat_url("https://notollama.com") == "https://notollama.com/chat/completions"

@@ -46,6 +46,7 @@ const PROVIDER_PATTERNS = [
 const SETUP_PROVIDER_URLS = {
   deepseek: { name: 'DeepSeek', url: 'https://api.deepseek.com/v1' },
   openai: { name: 'OpenAI', url: 'https://api.openai.com/v1' },
+  codex: { name: 'ChatGPT Codex Subscription', url: 'https://chatgpt.com/backend-api/codex' },
   openrouter: { name: 'OpenRouter', url: 'https://openrouter.ai/api/v1' },
   ollama: { name: 'Ollama Cloud', url: 'https://ollama.com/api' },
   xai: { name: 'xAI', url: 'https://api.x.ai/v1' },
@@ -54,7 +55,7 @@ const SETUP_PROVIDER_URLS = {
   gemini: { name: 'Gemini', url: 'https://generativelanguage.googleapis.com/v1beta/openai' },
   google: { name: 'Gemini', url: 'https://generativelanguage.googleapis.com/v1beta/openai' },
 };
-const SETUP_PROVIDER_NAMES = ['deepseek', 'openai', 'openrouter', 'ollama', 'xai', 'anthropic', 'groq', 'gemini'];
+const SETUP_PROVIDER_NAMES = ['deepseek', 'openai', 'codex', 'openrouter', 'ollama', 'xai', 'anthropic', 'groq', 'gemini'];
 const SETUP_PROVIDER_HINT = SETUP_PROVIDER_NAMES.slice(0, -1).join(', ') + ', or ' + SETUP_PROVIDER_NAMES[SETUP_PROVIDER_NAMES.length - 1];
 const SETUP_LOCAL_ICON = '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px;margin-right:5px;"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/></svg>';
 const SETUP_API_ICON = '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px;margin-right:5px;"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>';
@@ -67,6 +68,8 @@ function _setupProviderFromInput(input) {
     deepseek: 'deepseek',
     openai: 'openai',
     chatgpt: 'openai',
+    codex: 'codex',
+    chatgptcodex: 'codex',
     openrouter: 'openrouter',
     ollama: 'ollama',
     ollamacloud: 'ollama',
@@ -88,6 +91,7 @@ function _extractSetupProviderCredential(input) {
     ['deepseek ai', 'deepseek'], ['deepseek', 'deepseek'],
     ['open router', 'openrouter'], ['openrouter', 'openrouter'],
     ['ollama cloud', 'ollama'], ['ollama', 'ollama'],
+    ['chatgpt codex', 'codex'], ['gpt codex', 'codex'], ['codex', 'codex'],
     ['open ai', 'openai'], ['openai', 'openai'], ['chatgpt', 'openai'],
     ['anthropic', 'anthropic'], ['claude', 'anthropic'],
     ['groq', 'groq'],
@@ -112,9 +116,15 @@ function _normalizeSetupBaseUrl(raw) {
   if (!/^https?:\/\//i.test(u)) u = 'http://' + u;
   u = u.replace(/\/+$/, '');
   u = u.replace(/\/v1\/(models|chat\/completions|completions|messages)\/?$/i, '/v1');
-  u = u.replace(/\/(models|chat\/completions|completions|v1\/messages)\/?$/i, '');
+  u = u.replace(/\/(models|chat\/completions|completions|v1\/messages|responses)\/?$/i, '');
   u = u.replace(/\/v1\/v1$/i, '/v1');
-  if (!u.includes('api.') && !u.includes('openrouter') && !u.endsWith('/v1')) {
+  try {
+    const parsed = new URL(u);
+    if (parsed.hostname.endsWith('chatgpt.com') && parsed.pathname.startsWith('/backend-api/codex')) {
+      u = 'https://chatgpt.com/backend-api/codex';
+    }
+  } catch (_) {}
+  if (!u.includes('api.') && !u.includes('openrouter') && !u.includes('chatgpt.com') && !u.endsWith('/v1')) {
     try {
       const parsed = new URL(u);
       if (!parsed.pathname || parsed.pathname === '/') u += '/v1';
@@ -150,8 +160,12 @@ function _showSetupUserBubble(input, isUrl) {
   }
 }
 
-function _setupReply(text, remember = true) {
-  return typewriterReply(text);
+function _setupReply(text, remember = true, options = {}) {
+  if (options.html) {
+    slashReply(text);
+    return Promise.resolve();
+  }
+  return typewriterReply(text, options);
 }
 
 function _showSetupEndpointChoices() {
@@ -225,6 +239,27 @@ async function _hasConfiguredModels() {
   } catch {
     return false;
   }
+}
+
+function _codexCredentialGuide() {
+  return 'ChatGPT Codex Subscription uses OpenAI Codex OAuth, not a regular OpenAI API key.<br>'
+    + 'Best path: open Settings → Add Models → ChatGPT Codex Subscription and click <b>Connect with ChatGPT</b> for the device-code login.<br>'
+    + 'If you already have a Codex OAuth token JSON, paste it here. If you have a token and account id, paste <code>accessToken::account_id</code>.';
+}
+
+function _isCodexSetupProvider(provider) {
+  return provider && /chatgpt\.com\/backend-api\/codex/i.test(provider.url || '');
+}
+
+function _providerCredentialPrompt(provider) {
+  if (_isCodexSetupProvider(provider)) {
+    return _codexCredentialGuide();
+  }
+  return `Paste your ${provider.name} API key.`;
+}
+
+function _replyProviderCredentialPrompt(provider) {
+  return _setupReply(_providerCredentialPrompt(provider), true, { html: _isCodexSetupProvider(provider) });
 }
 
 function _setupProviderPrompt() {
@@ -548,6 +583,7 @@ function setupChatUrlForEndpoint(detected) {
   const base = (detected.base_url || '').replace(/\/+$/, '');
   if (detected.name === 'Anthropic') return base.replace(/\/v1$/, '') + '/v1/messages';
   if (base.includes('ollama.com')) return 'https://ollama.com/api/chat';
+  if (base.includes('chatgpt.com/backend-api/codex')) return 'https://chatgpt.com/backend-api/codex/responses';
   return base + '/chat/completions';
 }
 
@@ -640,7 +676,7 @@ async function handleSetupInput(input) {
     } else {
       pendingSetupProvider = paired.provider;
       setupMode = 'endpoint-key-for-provider';
-      await _setupReply(`Paste your ${paired.provider.name} API key now.`);
+      await _replyProviderCredentialPrompt(paired.provider);
     }
     return;
   }
@@ -694,7 +730,7 @@ async function handleSetupWizard(mode, input) {
     _addMessage('user', provider.name);
     pendingSetupProvider = provider;
     setupMode = 'endpoint-key-for-provider';
-    await _setupReply(`Paste your ${provider.name} API key.`);
+    await _replyProviderCredentialPrompt(provider);
     return;
   }
 
@@ -4749,7 +4785,7 @@ async function _cmdSetup(args, ctx) {
     } else {
       pendingSetupProvider = provider;
       setupMode = 'endpoint-key-for-provider';
-      await _setupReply(`Paste your ${provider.name} API key.`);
+      await _replyProviderCredentialPrompt(provider);
     }
     return true;
   }

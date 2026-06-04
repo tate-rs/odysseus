@@ -4,6 +4,7 @@
 Consolidates the 4+ copies of normalize_base / resolve_endpoint logic into one place.
 """
 
+import base64
 import json
 import logging
 import socket
@@ -133,7 +134,7 @@ def resolve_url(url: str) -> str:
 def normalize_base(url: str) -> str:
     """Strip known API path suffixes from a base URL."""
     url = (url or "").strip().rstrip("/")
-    for suffix in ["/models", "/chat/completions", "/completions", "/v1/messages"]:
+    for suffix in ["/models", "/chat/completions", "/completions", "/v1/messages", "/responses"]:
         if url.endswith(suffix):
             url = url[: -len(suffix)].rstrip("/")
     for suffix in ["/chat", "/tags", "/generate"]:
@@ -171,6 +172,8 @@ def build_chat_url(base: str) -> str:
         return _anthropic_api_root(base) + "/v1/messages"
     if provider == "ollama":
         return _ollama_api_root(base) + "/chat"
+    if provider == "codex":
+        return base.rstrip("/") + "/responses"
     return base + "/chat/completions"
 
 
@@ -185,6 +188,19 @@ def build_models_url(base: str) -> str:
     return base + "/models"
 
 
+def _decode_codex_account_id(token: str) -> str:
+    try:
+        payload = (token or "").split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        data = json.loads(base64.urlsafe_b64decode(payload.encode("ascii")).decode("utf-8"))
+        auth = data.get("https://api.openai.com/auth") if isinstance(data, dict) else None
+        if isinstance(auth, dict):
+            return str(auth.get("chatgpt_account_id") or "").strip()
+    except Exception:
+        pass
+    return ""
+
+
 def build_headers(api_key: Optional[str], base: str) -> Dict[str, str]:
     """Build auth headers for an endpoint."""
     provider = _detect_provider(base)
@@ -193,6 +209,40 @@ def build_headers(api_key: Optional[str], base: str) -> Dict[str, str]:
         if api_key:
             headers["x-api-key"] = api_key
         headers["anthropic-version"] = "2023-06-01"
+        return headers
+    if provider == "codex" and api_key:
+        token = str(api_key).strip()
+        account_id = ""
+        if token.startswith("{"):
+            try:
+                data = json.loads(token)
+                token = str(
+                    data.get("access_token")
+                    or data.get("accessToken")
+                    or data.get("access")
+                    or data.get("token")
+                    or token
+                ).strip()
+                account_id = str(
+                    data.get("account_id")
+                    or data.get("accountId")
+                    or data.get("accountID")
+                    or data.get("chatgpt_account_id")
+                    or ""
+                ).strip()
+            except Exception:
+                pass
+        elif "::" in token:
+            token, account_id = [part.strip() for part in token.split("::", 1)]
+        if not account_id:
+            account_id = _decode_codex_account_id(token)
+        headers["Authorization"] = f"Bearer {token}"
+        if account_id:
+            headers["chatgpt-account-id"] = account_id
+        headers["OpenAI-Beta"] = "responses=experimental"
+        headers["accept"] = "text/event-stream"
+        headers["originator"] = "pi"
+        headers["User-Agent"] = "pi (odysseus)"
         return headers
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"

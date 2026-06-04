@@ -311,6 +311,12 @@ def _detect_provider(url: str) -> str:
     """
     if _is_ollama_native_url(url):
         return "ollama"
+    try:
+        parsed = urlparse(url or "")
+        if _host_match(url, "chatgpt.com") and "/backend-api/codex" in (parsed.path or ""):
+            return "codex"
+    except Exception:
+        pass
     if _host_match(url, "anthropic.com"):
         return "anthropic"
     if _host_match(url, "openrouter.ai"):
@@ -327,6 +333,13 @@ def _provider_headers(provider: str, headers: Optional[Dict] = None) -> Dict[str
     if provider == "openrouter":
         h.setdefault("HTTP-Referer", "https://github.com/pewdiepie-archdaemon/odysseus")
         h.setdefault("X-OpenRouter-Title", "Odysseus")
+    if provider == "codex":
+        # ChatGPT Codex subscription endpoint follows the experimental
+        # Responses stream used by pi/openai-codex, not regular OpenAI REST.
+        h.setdefault("OpenAI-Beta", "responses=experimental")
+        h.setdefault("accept", "text/event-stream")
+        h.setdefault("originator", "pi")
+        h.setdefault("User-Agent", "pi (odysseus)")
     return h
 
 
@@ -337,6 +350,7 @@ def _provider_label(url: str) -> str:
     if _host_match(url, "anthropic.com"): return "Anthropic"
     if _host_match(url, "ollama.com"): return "Ollama Cloud"
     if _host_match(url, "x.ai"): return "xAI"
+    if _host_match(url, "chatgpt.com"): return "ChatGPT Codex"
     if _host_match(url, "openai.com"): return "OpenAI"
     if _host_match(url, "openrouter.ai"): return "OpenRouter"
     if _host_match(url, "groq.com"): return "Groq"
@@ -414,13 +428,24 @@ def _uses_max_completion_tokens(model: str) -> bool:
 # the API use its required default. (gpt-4.5 is intentionally excluded — it is
 # not a reasoning model and accepts temperature normally.)
 _FIXED_TEMPERATURE_MODELS = ("o1", "o3", "o4", "gpt-5")
+_CODEX_MODEL_PATTERNS = ("gpt-5-codex", "gpt-5.1-codex", "gpt-5.2-codex", "gpt-5.5-codex", "codex")
+
+def _is_codex_model(model: str) -> bool:
+    if not model:
+        return False
+    m = model.lower()
+    return any(p in m for p in _CODEX_MODEL_PATTERNS)
 
 def _restricts_temperature(model: str) -> bool:
     """Check if a model rejects any non-default temperature."""
     if not model:
         return False
     m = model.lower()
-    return any(m.startswith(p) or f"/{p}" in m for p in _FIXED_TEMPERATURE_MODELS)
+    return _is_codex_model(model) or any(m.startswith(p) or f"/{p}" in m for p in _FIXED_TEMPERATURE_MODELS)
+
+def _uses_responses_api(url: str, model: str) -> bool:
+    """True for GPT Codex / ChatGPT subscription endpoints that use Responses."""
+    return _detect_provider(url) == "codex" or (_host_match(url, "api.openai.com") and _is_codex_model(model))
 
 # Models that support structured thinking — may output </think> without opening tag
 _THINKING_MODEL_PATTERNS = ("qwen3", "qwq", "deepseek-r1", "deepseek-reasoner", "minimax", "m2-reap", "gemma")
@@ -583,6 +608,130 @@ def _parse_anthropic_response(data: dict) -> str:
         for block in data.get("content", [])
         if isinstance(block, dict) and block.get("type") == "text"
     )
+
+
+def _normalize_responses_url(url: str) -> str:
+    """Return a Responses API URL from either a base or chat-completions URL."""
+    base = (url or "").strip().rstrip("/")
+    for suffix in ("/chat/completions", "/completions", "/models", "/responses"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)].rstrip("/")
+            break
+    return base + "/responses"
+
+
+def _responses_text_content(content) -> str:
+    """Flatten OpenAI chat content into text for Responses input items."""
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if not isinstance(block, dict):
+                if block is not None:
+                    parts.append(str(block))
+                continue
+            if block.get("type") == "text":
+                parts.append(str(block.get("text") or ""))
+            elif block.get("type") == "image_url":
+                # Codex subscription/Responses is currently text-oriented in
+                # Odysseus; leave a small placeholder instead of stringifying a
+                # huge data URI into the prompt.
+                parts.append("[image]")
+        return "\n".join(p for p in parts if p)
+    return "" if content is None else str(content)
+
+
+def _build_responses_payload(model, messages, temperature, max_tokens, stream=False, tools=None, codex=False):
+    """Convert Odysseus' OpenAI-chat shape to OpenAI Responses shape.
+
+    This is used for GPT Codex models and ChatGPT Codex subscription endpoints.
+    It preserves function-call turns so the existing agent loop can continue to
+    append tool outputs in the format it already understands.
+    """
+    instructions = []
+    input_items = []
+    for m in messages or []:
+        role = m.get("role")
+        if role == "system":
+            txt = _responses_text_content(m.get("content"))
+            if txt:
+                instructions.append(txt)
+            continue
+        if role == "tool":
+            input_items.append({
+                "type": "function_call_output",
+                "call_id": m.get("tool_call_id") or "",
+                "output": _responses_text_content(m.get("content")),
+            })
+            continue
+        if role == "assistant" and isinstance(m.get("tool_calls"), list):
+            txt = _responses_text_content(m.get("content"))
+            if txt:
+                input_items.append({"role": "assistant", "content": txt})
+            for tc in m.get("tool_calls") or []:
+                fn = tc.get("function") or {}
+                input_items.append({
+                    "type": "function_call",
+                    "call_id": tc.get("id") or "",
+                    "name": fn.get("name") or "",
+                    "arguments": fn.get("arguments") or "{}",
+                })
+            continue
+        if role in ("user", "assistant", "developer"):
+            txt = _responses_text_content(m.get("content"))
+            if txt:
+                input_items.append({"role": role, "content": txt})
+
+    payload = {"model": model, "input": input_items or ""}
+    if codex:
+        payload.update({
+            "store": False,
+            "text": {"verbosity": "low"},
+            "include": ["reasoning.encrypted_content"],
+            "tool_choice": "auto",
+            "parallel_tool_calls": True,
+        })
+    if instructions:
+        payload["instructions"] = "\n\n".join(instructions)
+    # Codex/reasoning models reject non-default temperature; omit it.
+    if temperature is not None and not _restricts_temperature(model):
+        payload["temperature"] = temperature
+    if max_tokens and max_tokens > 0:
+        payload["max_output_tokens"] = max_tokens
+    if stream:
+        payload["stream"] = True
+    if tools:
+        out_tools = []
+        for t in tools:
+            if not isinstance(t, dict) or t.get("type") != "function":
+                continue
+            fn = t.get("function") or {}
+            if not fn.get("name"):
+                continue
+            out_tools.append({
+                "type": "function",
+                "name": fn.get("name"),
+                "description": fn.get("description", ""),
+                "parameters": fn.get("parameters", {"type": "object", "properties": {}}),
+            })
+        if out_tools:
+            payload["tools"] = out_tools
+    return payload
+
+
+def _parse_responses_text(data: dict) -> str:
+    if not isinstance(data, dict):
+        return ""
+    if data.get("output_text"):
+        return str(data.get("output_text") or "")
+    parts = []
+    for item in data.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "message":
+            for block in item.get("content") or []:
+                if isinstance(block, dict) and block.get("type") in ("output_text", "text"):
+                    parts.append(str(block.get("text") or ""))
+    return "".join(parts)
 
 
 def _as_content_blocks(content) -> List[Dict]:
@@ -899,7 +1048,10 @@ def llm_call(url: str, model: str, messages: List[Dict], temperature: float = LL
         logger.debug(f"Returning cached response for key: {cache_key}")
         return cached_response
 
-    if provider == "anthropic":
+    if _uses_responses_api(url, model):
+        target_url = _normalize_responses_url(url)
+        payload = _build_responses_payload(model, messages_copy, temperature, max_tokens, codex=(provider == "codex"))
+    elif provider == "anthropic":
         target_url = _normalize_anthropic_url(url)
         h = _build_anthropic_headers(headers)
         payload = _build_anthropic_payload(model, messages_copy, temperature, max_tokens)
@@ -930,7 +1082,9 @@ def llm_call(url: str, model: str, messages: List[Dict], temperature: float = LL
         raise HTTPException(502, f"Upstream {target_url} -> {r.status_code}: {r.text}")
     data = r.json()
     try:
-        if provider == "anthropic":
+        if _uses_responses_api(url, model):
+            response = _parse_responses_text(data)
+        elif provider == "anthropic":
             response = _parse_anthropic_response(data)
         elif provider == "ollama":
             response = _parse_ollama_response(data)
@@ -1042,7 +1196,11 @@ async def llm_call_async(
         logger.debug(f"Returning cached response for key: {cache_key}")
         return cached_response
 
-    if provider == "anthropic":
+    if _uses_responses_api(url, model):
+        target_url = _normalize_responses_url(url)
+        h = _provider_headers(provider, headers)
+        payload = _build_responses_payload(model, messages_copy, temperature, max_tokens, codex=(provider == "codex"))
+    elif provider == "anthropic":
         target_url = _normalize_anthropic_url(url)
         h = _build_anthropic_headers(headers)
         payload = _build_anthropic_payload(model, messages_copy, temperature, max_tokens)
@@ -1093,7 +1251,9 @@ async def llm_call_async(
             _clear_host_dead(target_url)
             data = r.json()
             try:
-                if provider == "anthropic":
+                if _uses_responses_api(url, model):
+                    response = _parse_responses_text(data)
+                elif provider == "anthropic":
                     response = _parse_anthropic_response(data)
                 elif provider == "ollama":
                     response = _parse_ollama_response(data)
@@ -1146,7 +1306,11 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
     else:
         messages_copy = non_sys
 
-    if provider == "anthropic":
+    if _uses_responses_api(url, model):
+        target_url = _normalize_responses_url(url)
+        h = _provider_headers(provider, headers)
+        payload = _build_responses_payload(model, messages_copy, temperature, max_tokens, stream=True, tools=tools, codex=(provider == "codex"))
+    elif provider == "anthropic":
         target_url = _normalize_anthropic_url(url)
         h = _build_anthropic_headers(headers)
         payload = _build_anthropic_payload(model, messages_copy, temperature, max_tokens, stream=True, tools=tools)
@@ -1347,6 +1511,102 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
             yield f'event: error\ndata: {json.dumps({"error": "Network error", "status": 502})}\n\n'
         except Exception as e:
             logger.error(f"Anthropic stream error: {e}")
+            yield f'event: error\ndata: {json.dumps({"error": str(e), "status": 502})}\n\n'
+        return
+
+    # ── OpenAI Responses / GPT Codex streaming ──
+    if _uses_responses_api(url, model):
+        _resp_tool_blocks: Dict[str, Dict] = {}
+        _resp_index_to_key: Dict[str, str] = {}
+        _resp_input_tokens = 0
+        _resp_output_tokens = 0
+        _resp_emitted_text = False
+        try:
+            client = _get_http_client()
+            async with client.stream('POST', target_url, json=payload, headers=h, timeout=stream_timeout) as r:
+                _clear_host_dead(target_url)
+                if r.status_code != 200:
+                    raw = (await r.aread()).decode(errors="replace")
+                    friendly = _format_upstream_error(r.status_code, raw, target_url)
+                    yield f'event: error\ndata: {json.dumps({"status": r.status_code, "text": friendly, "raw": raw[:500]})}\n\n'
+                    return
+                async for line in r.aiter_lines():
+                    if not line or not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if not data or data == "[DONE]":
+                        continue
+                    try:
+                        j = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+                    evt = j.get("type") or ""
+                    if evt in ("response.output_text.delta", "response.refusal.delta"):
+                        delta = j.get("delta") or ""
+                        if delta:
+                            _resp_emitted_text = True
+                            yield f'data: {json.dumps({"delta": delta})}\n\n'
+                    elif evt == "response.output_item.added":
+                        item = j.get("item") or {}
+                        if item.get("type") == "function_call":
+                            key = item.get("id") or item.get("call_id") or str(j.get("output_index", len(_resp_tool_blocks)))
+                            if j.get("output_index") is not None:
+                                _resp_index_to_key[str(j.get("output_index"))] = key
+                            _resp_tool_blocks[key] = {
+                                "id": item.get("call_id") or key,
+                                "name": item.get("name") or "",
+                                "arguments": item.get("arguments") or "",
+                            }
+                    elif evt == "response.function_call_arguments.delta":
+                        idx_key = str(j.get("output_index", 0))
+                        key = j.get("item_id") or _resp_index_to_key.get(idx_key) or idx_key
+                        if key not in _resp_tool_blocks:
+                            _resp_tool_blocks[key] = {"id": key, "name": "", "arguments": ""}
+                        delta = j.get("delta") or ""
+                        _resp_tool_blocks[key]["arguments"] += delta
+                        if delta and _resp_tool_blocks[key].get("name") in ("create_document", "update_document", "edit_document"):
+                            yield f'data: {json.dumps({"type": "tool_call_delta", "index": len(_resp_tool_blocks) - 1, "name": _resp_tool_blocks[key]["name"], "arg_delta": delta})}\n\n'
+                    elif evt == "response.function_call_arguments.done":
+                        idx_key = str(j.get("output_index", 0))
+                        key = j.get("item_id") or _resp_index_to_key.get(idx_key) or idx_key
+                        if key in _resp_tool_blocks and j.get("arguments") is not None:
+                            _resp_tool_blocks[key]["arguments"] = j.get("arguments") or ""
+                    elif evt == "response.completed":
+                        resp = j.get("response") or {}
+                        if not _resp_emitted_text:
+                            text = _parse_responses_text(resp)
+                            if text:
+                                yield f'data: {json.dumps({"delta": text})}\n\n'
+                        usage = resp.get("usage") or {}
+                        _resp_input_tokens = usage.get("input_tokens") or usage.get("prompt_tokens") or 0
+                        _resp_output_tokens = usage.get("output_tokens") or usage.get("completion_tokens") or 0
+                        if _resp_tool_blocks:
+                            calls = list(_resp_tool_blocks.values())
+                            yield f'data: {json.dumps({"type": "tool_calls", "calls": calls})}\n\n'
+                        if _resp_input_tokens or _resp_output_tokens:
+                            yield f'data: {json.dumps({"type": "usage", "data": {"input_tokens": _resp_input_tokens, "output_tokens": _resp_output_tokens}})}\n\n'
+                        yield "data: [DONE]\n\n"
+                        return
+                    elif evt == "response.failed":
+                        resp = j.get("response") or {}
+                        err = resp.get("error") or {}
+                        msg = err.get("message") if isinstance(err, dict) else str(err or "")
+                        yield f'event: error\ndata: {json.dumps({"error": msg or "Responses API failed", "status": 400})}\n\n'
+                        return
+                if _resp_tool_blocks:
+                    yield f'data: {json.dumps({"type": "tool_calls", "calls": list(_resp_tool_blocks.values())})}\n\n'
+                yield "data: [DONE]\n\n"
+        except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+            _cooled = _mark_host_dead(target_url)
+            _tail = f" — host cooled for {DEAD_HOST_COOLDOWN:.0f}s" if _cooled else " — transient, will retry"
+            logger.warning(f"Responses stream connect to {target_url} failed: {e}{_tail}")
+            yield f'event: error\ndata: {json.dumps({"error": f"Cannot reach {_host_key(target_url)}", "status": 503})}\n\n'
+        except httpx.ReadTimeout:
+            yield f'event: error\ndata: {json.dumps({"error": "Read timeout", "status": 504})}\n\n'
+        except httpx.NetworkError:
+            yield f'event: error\ndata: {json.dumps({"error": "Network error", "status": 502})}\n\n'
+        except Exception as e:
+            logger.error(f"Responses stream error: {e}")
             yield f'event: error\ndata: {json.dumps({"error": str(e), "status": 502})}\n\n'
         return
 

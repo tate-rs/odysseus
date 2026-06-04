@@ -181,6 +181,9 @@ class TestMatchProviderCurated:
     def test_ollama_url(self):
         assert _match_provider_curated("https://ollama.com/api", "openai") == "ollama"
 
+    def test_chatgpt_codex_url(self):
+        assert _match_provider_curated("https://chatgpt.com/backend-api/codex", "openai") == "codex-subscription"
+
     def test_no_url_match_returns_provider(self):
         assert _match_provider_curated("https://localhost:1234", "openai") == "openai"
 
@@ -219,6 +222,10 @@ class TestCurateModels:
         curated, extra = _curate_models([], "openai")
         assert curated == []
         assert extra == []
+
+    def test_codex_subscription_includes_newest(self):
+        curated = _PROVIDER_CURATED["codex-subscription"]
+        assert curated[0] == "gpt-5.5"
 
     def test_deepseek_curated(self):
         models = ["deepseek-chat", "deepseek-reasoner", "deepseek-coder"]
@@ -1318,3 +1325,47 @@ def test_manual_refresh_timeout_keeps_cached_models_and_warns(monkeypatch):
     assert db.commits == 0
     assert response.headers["X-Model-Refresh-Status"] == "failed"
     assert "kept cached models" in response.headers["X-Model-Refresh-Warning"]
+
+
+def test_probe_codex_subscription_validates_with_responses(monkeypatch):
+    calls = []
+
+    def fake_post(url, headers=None, json=None, timeout=None, verify=None):
+        calls.append({"url": url, "headers": headers or {}, "json": json or {}})
+        return SimpleNamespace(status_code=200, is_success=True)
+
+    monkeypatch.setattr(model_routes.httpx, "post", fake_post)
+
+    models = _probe_endpoint(
+        "https://chatgpt.com/backend-api/codex",
+        api_key='{"accessToken":"access-token","accountId":"acct_123"}',
+        timeout=3,
+    )
+
+    assert models[0] == "gpt-5.5"
+    assert calls[0]["url"] == "https://chatgpt.com/backend-api/codex/responses"
+    assert calls[0]["headers"]["Authorization"] == "Bearer access-token"
+    assert calls[0]["headers"]["chatgpt-account-id"] == "acct_123"
+    assert calls[0]["json"]["model"] == "gpt-5.5"
+
+
+def test_probe_codex_subscription_rejects_bad_token(monkeypatch):
+    def fake_post(url, headers=None, json=None, timeout=None, verify=None):
+        return SimpleNamespace(status_code=401, is_success=False)
+
+    monkeypatch.setattr(model_routes.httpx, "post", fake_post)
+
+    assert _probe_endpoint("https://chatgpt.com/backend-api/codex", api_key="bad", timeout=3) == []
+
+
+def test_probe_codex_subscription_trusts_device_oauth_json(monkeypatch):
+    def fail_post(*args, **kwargs):
+        raise AssertionError("OAuth-created Codex endpoint should not burn a probe request")
+
+    monkeypatch.setattr(model_routes.httpx, "post", fail_post)
+    models = _probe_endpoint(
+        "https://chatgpt.com/backend-api/codex",
+        api_key='{"access":"access-token","refresh":"refresh-token","accountId":"acct_123"}',
+        timeout=3,
+    )
+    assert models[0] == "gpt-5.5"

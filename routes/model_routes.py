@@ -216,9 +216,15 @@ def _rewrite_loopback_for_docker(base_url: str, *, container_local: bool = False
 # A model ID matches if it starts with or equals a curated entry.
 _PROVIDER_CURATED = {
     "openai": [
-        "gpt-5.2", "gpt-5.2-pro", "gpt-5", "gpt-5-pro", "gpt-5-mini", "gpt-5-nano",
+        "gpt-5.2", "gpt-5.2-pro", "gpt-5.5-codex", "gpt-5.2-codex", "gpt-5.1-codex", "gpt-5-codex",
+        "gpt-5", "gpt-5-pro", "gpt-5-mini", "gpt-5-nano",
         "gpt-4o", "gpt-4o-mini", "o3", "o4-mini", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano",
         "gpt-image-1.5", "gpt-image-1", "dall-e-3", "tts-1", "whisper-1",
+    ],
+    "codex-subscription": [
+        "gpt-5.5", "gpt-5.4", "gpt-5.4-mini",
+        "gpt-5.3-codex-spark", "gpt-5.3-codex",
+        "gpt-5.2-codex", "gpt-5.1-codex", "gpt-5.1-codex-max", "gpt-5.1-codex-mini", "gpt-5-codex",
     ],
     "anthropic": [
         "claude-sonnet-4", "claude-opus-4", "claude-haiku-4",
@@ -284,6 +290,7 @@ _HOST_TO_CURATED = (
     ("x.ai", "xai"),
     ("openrouter.ai", "openrouter"),
     ("ollama.com", "ollama"),
+    ("chatgpt.com", "codex-subscription"),
 )
 
 
@@ -478,7 +485,7 @@ _NON_CHAT_PREFIXES = (
     "sora", "gpt-image", "chatgpt-image",
 )
 _NON_CHAT_CONTAINS = (
-    "-realtime", "-transcribe", "-tts", "-codex",
+    "-realtime", "-transcribe", "-tts",
     "codex-",
 )
 _NON_CHAT_EXACT_PREFIXES = (
@@ -530,14 +537,19 @@ def _probe_single_model(base: str, api_key: str, model_id: str, timeout: int = 1
         target_url = build_chat_url(base)
         h = build_headers(api_key, base)
         h["Content-Type"] = "application/json"
-        from src.llm_core import _uses_max_completion_tokens, _restricts_temperature
-        _max_key = "max_completion_tokens" if _uses_max_completion_tokens(model_id) else "max_tokens"
-        payload = {"model": model_id, "messages": messages, _max_key: 5}
+        from src.llm_core import _build_responses_payload, _normalize_responses_url, _uses_max_completion_tokens, _restricts_temperature, _uses_responses_api
+        _responses_probe = _uses_responses_api(target_url, model_id)
+        if _responses_probe:
+            target_url = _normalize_responses_url(target_url)
+            payload = _build_responses_payload(model_id, messages, 0.0, 5, stream=True, tools=_test_tools, codex=(provider == "codex"))
+        else:
+            _max_key = "max_completion_tokens" if _uses_max_completion_tokens(model_id) else "max_tokens"
+            payload = {"model": model_id, "messages": messages, _max_key: 5}
         # Reasoning models (o1/o3/o4/gpt-5) reject an explicit temperature, so a
         # probe that hardcodes one falsely reports a working endpoint as failing.
         if not _restricts_temperature(model_id):
             payload["temperature"] = 0.0
-        if _test_tools:
+        if _test_tools and not locals().get("_responses_probe", False):
             payload["tools"] = _test_tools
 
     try:
@@ -618,6 +630,50 @@ def _probe_endpoint(base_url: str, api_key: str = None, timeout: int = 5) -> Lis
     For Anthropic, queries their /v1/models API, falling back to hardcoded list."""
     from src.endpoint_resolver import resolve_url
     base = resolve_url(_normalize_base(base_url))
+    if _detect_provider(base) == "codex":
+        curated = list(_PROVIDER_CURATED.get("codex-subscription", []))
+        if not api_key:
+            return curated
+        try:
+            key_data = json.loads(str(api_key).strip()) if str(api_key).strip().startswith("{") else None
+            # A token produced by the device-code OAuth flow already proved the
+            # user authorized Codex. Avoid burning a model request just to list
+            # static subscription models; the generic ping endpoint is 403 by
+            # design on chatgpt.com/backend-api.
+            if isinstance(key_data, dict) and (key_data.get("access") or key_data.get("accessToken") or key_data.get("access_token")) and key_data.get("refresh"):
+                return curated
+        except Exception:
+            pass
+        from src.llm_core import _build_responses_payload, _normalize_responses_url
+        headers = build_headers(api_key, base)
+        headers["Content-Type"] = "application/json"
+        target_url = _normalize_responses_url(build_chat_url(base))
+        messages = [{"role": "user", "content": "Say OK"}]
+        last_status = None
+        for mid in curated:
+            try:
+                payload = _build_responses_payload(mid, messages, 0.0, 5, stream=True, codex=True)
+                r = httpx.post(target_url, headers=headers, json=payload, timeout=timeout, verify=llm_verify())
+                last_status = r.status_code
+                if r.is_success:
+                    return curated
+                body = r.text or ""
+                if r.status_code == 401 or (r.status_code == 403 and re.search(r"unauthori[sz]ed|invalid token|forbidden|account", body, re.I)):
+                    logger.warning("ChatGPT Codex subscription token rejected: HTTP %s", r.status_code)
+                    return []
+                # Try the next curated id on model-name/availability/entitlement errors.
+                if r.status_code in (400, 403, 404):
+                    continue
+                if r.status_code == 429:
+                    logger.warning("ChatGPT Codex validation rate-limited; keeping curated models")
+                    return curated
+                logger.warning("ChatGPT Codex validation failed: HTTP %s", r.status_code)
+                return []
+            except Exception as e:
+                logger.warning("ChatGPT Codex validation failed: %s", e)
+                return []
+        logger.warning("ChatGPT Codex validation failed for all curated models; last HTTP status: %s", last_status)
+        return []
     if _detect_provider(base) == "anthropic":
         # Try Anthropic's /v1/models endpoint first
         url = build_models_url(base)
@@ -664,13 +720,15 @@ def _probe_endpoint(base_url: str, api_key: str = None, timeout: int = 5) -> Lis
                         models.append(_e)
             return models
     except httpx.HTTPStatusError as e:
-        if api_key:
-            status = e.response.status_code if e.response is not None else "unknown"
+        status = e.response.status_code if e.response is not None else "unknown"
+        curated_key = _match_provider_curated(base, None)
+        if api_key and not _PROVIDER_CURATED.get(curated_key):
             logger.warning(f"Failed to probe {url} with API key: HTTP {status}")
             return []
-        logger.warning(f"Failed to probe {url}: {e}")
+        logger.warning(f"Failed to probe {url}: HTTP {status}")
     except Exception as e:
-        if api_key:
+        curated_key = _match_provider_curated(base, None)
+        if api_key and not _PROVIDER_CURATED.get(curated_key):
             logger.warning(f"Failed to probe {url} with API key: {e}")
             return []
         logger.warning(f"Failed to probe {url}: {e}")
@@ -878,6 +936,92 @@ def setup_model_routes(model_discovery):
 
     def _refresh_key(base: str, api_key: Optional[str]) -> str:
         return f"{base.rstrip('/')}\x00{api_key or ''}"
+
+    @router.post("/model-endpoints/codex/oauth/device/start")
+    def codex_oauth_device_start(request: Request):
+        """Start the same OpenAI Codex device-code OAuth flow used by pi."""
+        require_admin(request)
+        try:
+            r = httpx.post(
+                "https://auth.openai.com/api/accounts/deviceauth/usercode",
+                headers={"Content-Type": "application/json"},
+                json={"client_id": "app_EMoamEEZ73f0CkXaXp7hrann"},
+                timeout=15,
+                verify=llm_verify(),
+            )
+            if not r.is_success:
+                raise HTTPException(r.status_code, r.text or "Failed to start Codex device login")
+            data = r.json() or {}
+            return {
+                "device_auth_id": data.get("device_auth_id"),
+                "user_code": data.get("user_code"),
+                "verification_uri": "https://auth.openai.com/codex/device",
+                "interval": data.get("interval") or 5,
+                "expires_in": 900,
+            }
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(502, f"Failed to start Codex device login: {exc}")
+
+    @router.post("/model-endpoints/codex/oauth/device/poll")
+    def codex_oauth_device_poll(request: Request, body: Dict[str, Any] = Body(default_factory=dict)):
+        """Poll Codex device login and return a stored api_key JSON on success."""
+        require_admin(request)
+        device_auth_id = str(body.get("device_auth_id") or "").strip()
+        user_code = str(body.get("user_code") or "").strip()
+        if not device_auth_id or not user_code:
+            raise HTTPException(400, "Missing device_auth_id or user_code")
+        try:
+            poll = httpx.post(
+                "https://auth.openai.com/api/accounts/deviceauth/token",
+                headers={"Content-Type": "application/json"},
+                json={"device_auth_id": device_auth_id, "user_code": user_code},
+                timeout=15,
+                verify=llm_verify(),
+            )
+            if not poll.is_success:
+                text = poll.text or ""
+                if poll.status_code in (400, 403) and "pending" in text.lower():
+                    return Response(status_code=202)
+                raise HTTPException(poll.status_code, text or "Codex device login failed")
+            p = poll.json() or {}
+            auth_code = p.get("authorization_code")
+            verifier = p.get("code_verifier")
+            if not auth_code or not verifier:
+                raise HTTPException(502, "Codex device login response missing authorization code")
+            token_res = httpx.post(
+                "https://auth.openai.com/oauth/token",
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                data={
+                    "grant_type": "authorization_code",
+                    "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
+                    "code": auth_code,
+                    "code_verifier": verifier,
+                    "redirect_uri": "https://auth.openai.com/deviceauth/callback",
+                },
+                timeout=15,
+                verify=llm_verify(),
+            )
+            if not token_res.is_success:
+                raise HTTPException(token_res.status_code, token_res.text or "Codex token exchange failed")
+            tok = token_res.json() or {}
+            access = tok.get("access_token")
+            if not access:
+                raise HTTPException(502, "Codex token response missing access_token")
+            from src.endpoint_resolver import _decode_codex_account_id
+            account_id = _decode_codex_account_id(str(access))
+            api_key_payload = {
+                "access": access,
+                "refresh": tok.get("refresh_token"),
+                "expires": int(_time.time() * 1000) + int(tok.get("expires_in") or 0) * 1000,
+                "accountId": account_id,
+            }
+            return {"api_key": json.dumps(api_key_payload), "account_id": account_id, "expires_in": tok.get("expires_in")}
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(502, f"Codex device login failed: {exc}")
 
     def _ts(value: Any) -> float:
         try:
@@ -1495,7 +1639,7 @@ def setup_model_routes(model_discovery):
                 if refresh_timeout is not None:
                     existing.model_refresh_timeout = refresh_timeout
                     changed = True
-                if api_key.strip() and not existing.api_key:
+                if api_key.strip() and api_key.strip() != (existing.api_key or ""):
                     existing.api_key = api_key.strip()
                     changed = True
                 if should_probe:

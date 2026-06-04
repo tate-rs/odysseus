@@ -701,10 +701,69 @@ function initEndpointForm() {
     pickerCurrent.querySelector('.adm-provider-logo').innerHTML = logo;
     pickerCurrent.querySelector('.adm-provider-name').textContent = opt.textContent;
   }
+  function _isCodexSubscriptionProvider(value) {
+    return /chatgpt\.com\/backend-api\/codex/i.test(value || '');
+  }
+  async function _startCodexOAuth() {
+    const hint = el('adm-epProviderHint');
+    const keyInput = el('adm-epApiKey');
+    const btn = el('adm-codex-oauth-btn');
+    if (btn) { btn.disabled = true; btn.textContent = 'Starting...'; }
+    try {
+      const startRes = await fetch('/api/model-endpoints/codex/oauth/device/start', { method: 'POST', credentials: 'same-origin' });
+      const start = await startRes.json().catch(() => ({}));
+      if (!startRes.ok) throw new Error(start.detail || 'Could not start login');
+      const code = start.user_code || '';
+      const uri = start.verification_uri || 'https://auth.openai.com/codex/device';
+      window.open(uri, '_blank', 'noopener');
+      if (hint) hint.innerHTML = `Opened ChatGPT Codex login. Enter code <code>${esc(code)}</code> at <a href="${uri}" target="_blank" rel="noopener" style="color:var(--accent,var(--red));">${uri}</a>. Waiting for authorization...`;
+      const intervalMs = Math.max(1000, Number(start.interval || 5) * 1000);
+      const deadline = Date.now() + Math.max(60, Number(start.expires_in || 900)) * 1000;
+      while (Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, intervalMs));
+        const pollRes = await fetch('/api/model-endpoints/codex/oauth/device/poll', {
+          method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ device_auth_id: start.device_auth_id, user_code: code }),
+        });
+        if (pollRes.status === 202) continue;
+        const poll = await pollRes.json().catch(() => ({}));
+        if (!pollRes.ok) throw new Error(poll.detail || 'Login failed');
+        if (poll.api_key) {
+          if (keyInput) keyInput.value = poll.api_key;
+          if (hint) hint.innerHTML = `Codex login connected${poll.account_id ? ` for account <code>${esc(poll.account_id)}</code>` : ''}. Click <b>Test</b> or <b>Add</b>.`;
+          return;
+        }
+      }
+      throw new Error('Login timed out');
+    } catch (e) {
+      if (hint) hint.innerHTML = `Codex login failed: ${esc(e && e.message ? e.message : String(e))}`;
+    } finally {
+      const latest = el('adm-codex-oauth-btn');
+      if (latest) { latest.disabled = false; latest.textContent = 'Connect with ChatGPT'; }
+    }
+  }
+  function _syncProviderHint() {
+    const hint = el('adm-epProviderHint');
+    const keyInput = el('adm-epApiKey');
+    if (!hint) return;
+    if (_isCodexSubscriptionProvider(provider.value || urlInput.value)) {
+      hint.style.display = '';
+      hint.innerHTML = 'ChatGPT Codex Subscription uses OpenAI Codex OAuth, not a regular OpenAI API key. '
+        + '<button type="button" class="admin-btn-sm" id="adm-codex-oauth-btn" style="margin-right:6px;">Connect with ChatGPT</button>'
+        + 'Or paste an existing Codex OAuth token JSON below. If you have a token and account id, paste <code>accessToken::account_id</code>.';
+      hint.querySelector('#adm-codex-oauth-btn')?.addEventListener('click', _startCodexOAuth);
+      if (keyInput) keyInput.placeholder = 'Codex OAuth token JSON or accessToken::account_id';
+    } else {
+      hint.style.display = 'none';
+      hint.textContent = '';
+      if (keyInput) keyInput.placeholder = 'API key';
+    }
+  }
   if (picker && pickerBtn && pickerMenu && pickerCurrent) {
     _renderPickerMenu();
     _syncPickerCurrent();
     if (provider.value && !urlInput.value) urlInput.value = provider.value;
+    _syncProviderHint();
     pickerBtn.addEventListener('click', (e) => {
       e.stopPropagation();
       pickerMenu.classList.toggle('hidden');
@@ -717,6 +776,7 @@ function initEndpointForm() {
       pickerMenu.classList.add('hidden');
       _renderPickerMenu();
       _syncPickerCurrent();
+      _syncProviderHint();
     });
     document.addEventListener('click', (e) => {
       if (!picker.contains(e.target)) pickerMenu.classList.add('hidden');
@@ -727,6 +787,7 @@ function initEndpointForm() {
     if (provider.value) urlInput.value = provider.value;
     else urlInput.value = '';
     if (kindSel) kindSel.value = provider.value ? 'api' : 'proxy';
+    _syncProviderHint();
   });
   urlInput.addEventListener('input', () => {
     if (provider.value && urlInput.value.trim() !== provider.value) {
@@ -735,6 +796,7 @@ function initEndpointForm() {
       _renderPickerMenu();
       _syncPickerCurrent();
     }
+    _syncProviderHint();
   });
   if (kindSel) kindSel.value = provider.value ? 'api' : (kindSel.value || 'proxy');
   function _apiEndpointKind() {
@@ -753,7 +815,7 @@ function initEndpointForm() {
     u = u.replace(/\/+$/, '');
     // Strip trailing paths that shouldn't be in a base URL
     u = u.replace(/\/v1\/(models|chat\/completions|completions|messages)\/?$/i, '/v1');
-    u = u.replace(/\/(models|chat\/completions|completions|v1\/messages)\/?$/i, '');
+    u = u.replace(/\/(models|chat\/completions|completions|v1\/messages|responses)\/?$/i, '');
     u = u.replace(/\/api\/(chat|tags|generate)\/?$/i, '/api');
     // Fix double /v1/v1
     u = u.replace(/\/v1\/v1$/, '/v1');
@@ -764,9 +826,12 @@ function initEndpointForm() {
       if (parsed.hostname.endsWith('ollama.com')) {
         u = 'https://ollama.com/api';
       }
+      if (parsed.hostname.endsWith('chatgpt.com') && parsed.pathname.startsWith('/backend-api/codex')) {
+        u = 'https://chatgpt.com/backend-api/codex';
+      }
     } catch(e) {}
     // Ensure /v1 suffix for bare host:port URLs (not cloud providers)
-    if (!u.includes('api.') && !u.includes('openrouter') && !u.includes('ollama.com') && !u.endsWith('/v1')) {
+    if (!u.includes('api.') && !u.includes('openrouter') && !u.includes('ollama.com') && !u.includes('chatgpt.com') && !u.endsWith('/v1')) {
       try {
         const parsed = new URL(u);
         if (!parsed.pathname || parsed.pathname === '/') {
@@ -892,6 +957,7 @@ function initEndpointForm() {
         const count = d.models ? d.models.length : 0;
         urlInput.value = ''; urlInput.style.display = '';
         el('adm-epApiKey').value = ''; provider.value = '';
+        _syncProviderHint();
         if (kindSel) kindSel.value = 'proxy';
         if (epType) epType.value = 'llm';
         if (d.id) _recentlyAddedEpId = String(d.id);

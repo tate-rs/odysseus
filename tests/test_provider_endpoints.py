@@ -37,6 +37,9 @@ PROVIDER_CASES = [
     ("openai", "https://api.openai.com/v1",
      "https://api.openai.com/v1/chat/completions",
      "https://api.openai.com/v1/models"),
+    ("chatgpt_codex", "https://chatgpt.com/backend-api/codex",
+     "https://chatgpt.com/backend-api/codex/responses",
+     "https://chatgpt.com/backend-api/codex/models"),
     ("anthropic", "https://api.anthropic.com",
      "https://api.anthropic.com/v1/messages",
      "https://api.anthropic.com/v1/models"),
@@ -129,6 +132,24 @@ def test_headers_openrouter_adds_attribution():
     assert h["X-OpenRouter-Title"] == "Odysseus"
 
 
+def test_headers_chatgpt_codex_accept_account_suffix():
+    h = er.build_headers("access-token::acct_123", "https://chatgpt.com/backend-api/codex")
+    assert h["Authorization"] == "Bearer access-token"
+    assert h["chatgpt-account-id"] == "acct_123"
+    assert h["OpenAI-Beta"] == "responses=experimental"
+    assert h["accept"] == "text/event-stream"
+    assert h["originator"] == "pi"
+
+
+def test_headers_chatgpt_codex_accept_session_json():
+    h = er.build_headers(
+        '{"accessToken":"access-token","accountId":"acct_123"}',
+        "https://chatgpt.com/backend-api/codex",
+    )
+    assert h["Authorization"] == "Bearer access-token"
+    assert h["chatgpt-account-id"] == "acct_123"
+
+
 def test_headers_omit_authorization_when_no_key():
     assert er.build_headers(None, "https://api.openai.com/v1") == {}
 
@@ -139,6 +160,7 @@ def test_headers_omit_authorization_when_no_key():
     ("https://api.openai.com/v1/chat/completions", "https://api.openai.com/v1"),
     ("https://api.openai.com/v1/completions", "https://api.openai.com/v1"),
     ("https://api.openai.com/v1/models/", "https://api.openai.com/v1"),
+    ("https://chatgpt.com/backend-api/codex/responses", "https://chatgpt.com/backend-api/codex"),
     ("https://api.anthropic.com/v1/messages", "https://api.anthropic.com"),
     ("http://localhost:11434/api/chat", "http://localhost:11434/api"),
     ("http://localhost:11434/api/tags", "http://localhost:11434/api"),
