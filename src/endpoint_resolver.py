@@ -244,6 +244,9 @@ def build_headers(api_key: Optional[str], base: str) -> Dict[str, str]:
         headers["originator"] = "pi"
         headers["User-Agent"] = "pi (odysseus)"
         return headers
+    if provider == "copilot":
+        from src.copilot import copilot_headers
+        return copilot_headers(api_key)
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     if provider == "openrouter":
