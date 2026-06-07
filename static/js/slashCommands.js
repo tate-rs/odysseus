@@ -55,8 +55,10 @@ const SETUP_PROVIDER_URLS = {
   groq: { name: 'Groq', url: 'https://api.groq.com/openai/v1' },
   gemini: { name: 'Gemini', url: 'https://generativelanguage.googleapis.com/v1beta/openai' },
   google: { name: 'Gemini', url: 'https://generativelanguage.googleapis.com/v1beta/openai' },
+  'opencode-zen': { name: 'OpenCode Zen', url: 'https://opencode.ai/zen/v1' },
+  'opencode-go': { name: 'OpenCode Go', url: 'https://opencode.ai/zen/go/v1' },
 };
-const SETUP_PROVIDER_NAMES = ['deepseek', 'openai', 'codex', 'openrouter', 'ollama', 'xai', 'anthropic', 'groq', 'gemini'];
+const SETUP_PROVIDER_NAMES = ['deepseek', 'openai', 'openrouter', 'ollama', 'xai', 'anthropic', 'groq', 'gemini', 'opencode-zen', 'opencode-go', 'codex'];
 const SETUP_PROVIDER_HINT = SETUP_PROVIDER_NAMES.slice(0, -1).join(', ') + ', or ' + SETUP_PROVIDER_NAMES[SETUP_PROVIDER_NAMES.length - 1];
 const SETUP_LOCAL_ICON = '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px;margin-right:5px;"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/></svg>';
 const SETUP_API_ICON = '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px;margin-right:5px;"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>';
@@ -252,15 +254,17 @@ function _isCodexSetupProvider(provider) {
   return provider && /chatgpt\.com\/backend-api\/codex/i.test(provider.url || '');
 }
 
-function _providerCredentialPrompt(provider) {
+function _providerCredentialPrompt(provider, topic) {
   if (_isCodexSetupProvider(provider)) {
     return _codexCredentialGuide();
   }
-  return `Paste your ${provider.name} API key.`;
+
+  const _slug = (topic || '').toLowerCase();
+  return `Paste your ${provider.name} API key, or run \`/setup ${_slug} <api-key>\` to set it in one step.`
 }
 
-function _replyProviderCredentialPrompt(provider) {
-  return _setupReply(_providerCredentialPrompt(provider), true, { html: _isCodexSetupProvider(provider) });
+function _replyProviderCredentialPrompt(provider, topic) {
+  return _setupReply(_providerCredentialPrompt(provider, topic), true, { html: _isCodexSetupProvider(provider) });
 }
 
 function _setupProviderPrompt() {
@@ -1204,6 +1208,22 @@ async function _cmdWorkspace(args, ctx) {
     return true;
   }
   slashReply('Usage: <code>/workspace</code> · <code>set /path</code> · <code>clear</code> · <code>pick</code>');
+  return true;
+}
+// Plan mode: drive the real toggle pill (#plan-toggle-btn) so its per-mode
+// persistence/UI logic runs. Only meaningful in agent mode.
+async function _cmdTogglePlan(args, ctx) {
+  const btn = document.getElementById('plan-toggle-btn');
+  const chk = document.getElementById('plan-toggle');
+  if (!btn || btn.style.display === 'none' || btn.offsetParent === null) {
+    slashReply('Plan mode is only available in agent mode — switch to Agent first.');
+    return true;
+  }
+  const cur = !!(chk && chk.checked);
+  const v = (args[0] || '').toLowerCase();
+  const target = v === 'on' ? true : v === 'off' ? false : !cur;
+  if (target !== cur) btn.click();
+  slashReply(`Plan mode: ${target ? 'on' : 'off'}`);
   return true;
 }
 
@@ -4851,7 +4871,7 @@ async function _cmdSetup(args, ctx) {
     } else {
       pendingSetupProvider = provider;
       setupMode = 'endpoint-key-for-provider';
-      await _replyProviderCredentialPrompt(provider);
+  await _replyProviderCredentialPrompt(provider, topic);
     }
     return true;
   }
@@ -5517,6 +5537,7 @@ const COMMANDS = {
       'bash':      { handler: _cmdToggleBash,      alias: ['b','shell'],       help: 'Toggle bash/shell',       usage: '/toggle bash' },
       'research':  { handler: _cmdToggleResearch,  alias: ['r'],               help: 'Toggle deep research',    usage: '/toggle research' },
       'doc':       { handler: _cmdToggleDoc,       alias: [],     help: 'Toggle document editor',  usage: '/toggle doc' },
+      'plan':      { handler: _cmdTogglePlan,      alias: ['p'],  help: 'Toggle plan mode (agent)', usage: '/toggle plan' },
       'sidebar':   { handler: _cmdToggleSidebar,   alias: ['sb'], help: 'Cycle sidebar (full/mini/off)', usage: '/toggle sidebar [1|2|3]' },
       '_show':     { handler: _cmdToggleShow,      alias: [],     help: 'Show all toggle states',  usage: '/toggle' }
     }
@@ -5528,6 +5549,13 @@ const COMMANDS = {
     handler: _cmdWorkspace,
     noUserBubble: true,
     usage: '/workspace [set <path> | clear | pick]',
+  },
+  plan: {
+    alias: [],
+    category: 'Quick toggles',
+    help: 'Toggle plan mode (agent)',
+    handler: _cmdTogglePlan,
+    usage: '/plan [on|off]',
   },
   memory: {
     alias: ['m'],
@@ -5574,7 +5602,31 @@ const COMMANDS = {
     category: 'Getting started',
     help: 'Add local or API model endpoints',
     handler: _cmdSetup,
-    usage: '/setup local URL  ·  /setup groq KEY  ·  /setup copilot  ·  /setup endpoint'
+    usage: '/setup local URL  ·  /setup groq KEY  ·  /setup copilot  ·  /setup endpoint',
+    // Provider subs so the autocomplete popup surfaces "/setup deepseek",
+    // "/setup openai", etc. when the user types "/setup de". Each sub's
+    // handler is a thin wrapper that re-prepends the sub name and
+    // re-dispatches into _cmdSetup, which already knows how to handle
+    // bare-provider (prompts for the key) AND provider-with-key (saves it).
+    // Without the explicit handler, the slash-dispatcher errors with
+    // "subDef.handler is not a function".
+    subs: {
+      deepseek:   { help: 'DeepSeek',      usage: '/setup deepseek sk-...',     handler: (a, c) => _cmdSetup(['deepseek',   ...a], c) },
+      openai:     { help: 'OpenAI',        usage: '/setup openai sk-proj-...',  handler: (a, c) => _cmdSetup(['openai',     ...a], c) },
+      anthropic:  { help: 'Anthropic',     usage: '/setup anthropic sk-ant-...',handler: (a, c) => _cmdSetup(['anthropic',  ...a], c) },
+      openrouter: { help: 'OpenRouter',    usage: '/setup openrouter sk-or-...',handler: (a, c) => _cmdSetup(['openrouter', ...a], c) },
+      groq:       { help: 'Groq',          usage: '/setup groq gsk_...',        handler: (a, c) => _cmdSetup(['groq',       ...a], c) },
+      gemini:     { help: 'Google Gemini', alias: ['google'], usage: '/setup gemini AIza...', handler: (a, c) => _cmdSetup(['gemini', ...a], c) },
+      xai:        { help: 'xAI (Grok)',    alias: ['grok'],   usage: '/setup xai xai-...',   handler: (a, c) => _cmdSetup(['xai',    ...a], c) },
+      ollama:     { help: 'Ollama Cloud',  usage: '/setup ollama KEY',          handler: (a, c) => _cmdSetup(['ollama',     ...a], c) },
+      copilot:    { help: 'GitHub Copilot', usage: '/setup copilot',            handler: (a, c) => _cmdSetup(['copilot',    ...a], c) },
+      local:      { help: 'Local model server (vLLM / LM Studio / llama.cpp / Ollama)',
+                    usage: '/setup local http://localhost:8000/v1',
+                    handler: (a, c) => _cmdSetup(['local', ...a], c) },
+      endpoint:   { help: 'Open the endpoint manager in Settings',
+                    usage: '/setup endpoint',
+                    handler: (a, c) => _cmdSetup(['endpoint', ...a], c) },
+    },
   },
   demo: {
     alias: ['tour'],
