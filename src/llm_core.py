@@ -705,10 +705,16 @@ def _build_responses_payload(model, messages, temperature, max_tokens, stream=Fa
         })
     if instructions:
         payload["instructions"] = "\n\n".join(instructions)
+    elif codex:
+        # ChatGPT's Codex subscription Responses endpoint rejects requests
+        # without a non-empty `instructions` field, even for simple probe or
+        # user-only prompts. Keep this generic so caller-provided prompts still
+        # control the task.
+        payload["instructions"] = "You are ChatGPT, a helpful assistant."
     # Codex/reasoning models reject non-default temperature; omit it.
     if temperature is not None and not _restricts_temperature(model):
         payload["temperature"] = temperature
-    if max_tokens and max_tokens > 0:
+    if max_tokens and max_tokens > 0 and not codex:
         payload["max_output_tokens"] = max_tokens
     if stream:
         payload["stream"] = True
@@ -744,6 +750,51 @@ def _parse_responses_text(data: dict) -> str:
             for block in item.get("content") or []:
                 if isinstance(block, dict) and block.get("type") in ("output_text", "text"):
                     parts.append(str(block.get("text") or ""))
+    return "".join(parts)
+
+
+def _parse_responses_sse_text(raw: str) -> str:
+    """Collect text from a completed Responses API SSE body.
+
+    ChatGPT Codex subscription endpoints require ``stream: true`` even when
+    Odysseus is making an internal non-streaming call (research planning,
+    extraction, probes). httpx can still buffer the full SSE response; this
+    helper turns that buffered event stream back into plain text.
+    """
+    parts = []
+    emitted_delta = False
+    error_msg = ""
+    for line in (raw or "").splitlines():
+        if not line or not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if not data or data == "[DONE]" or not data.startswith("{"):
+            continue
+        try:
+            j = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        evt = j.get("type") or ""
+        if evt in ("response.output_text.delta", "response.refusal.delta"):
+            delta = j.get("delta") or ""
+            if delta:
+                emitted_delta = True
+                parts.append(str(delta))
+        elif evt == "response.completed":
+            resp = j.get("response") or {}
+            if not emitted_delta:
+                text = _parse_responses_text(resp)
+                if text:
+                    parts.append(text)
+        elif evt == "response.failed":
+            resp = j.get("response") or {}
+            err = resp.get("error") or {}
+            error_msg = err.get("message") if isinstance(err, dict) else str(err or "")
+        elif evt == "error":
+            err = j.get("error") or j
+            error_msg = err.get("message") if isinstance(err, dict) else str(err or "")
+    if error_msg and not parts:
+        raise ValueError(error_msg)
     return "".join(parts)
 
 
@@ -1063,7 +1114,7 @@ def llm_call(url: str, model: str, messages: List[Dict], temperature: float = LL
 
     if _uses_responses_api(url, model):
         target_url = _normalize_responses_url(url)
-        payload = _build_responses_payload(model, messages_copy, temperature, max_tokens, codex=(provider == "codex"))
+        payload = _build_responses_payload(model, messages_copy, temperature, max_tokens, stream=(provider == "codex"), codex=(provider == "codex"))
     elif provider == "anthropic":
         target_url = _normalize_anthropic_url(url)
         h = _build_anthropic_headers(headers)
@@ -1096,21 +1147,23 @@ def llm_call(url: str, model: str, messages: List[Dict], temperature: float = LL
         raise HTTPException(502, f"POST {target_url} failed: {e}")
     if not r.is_success:
         raise HTTPException(502, f"Upstream {target_url} -> {r.status_code}: {r.text}")
-    data = r.json()
     try:
         if _uses_responses_api(url, model):
-            response = _parse_responses_text(data)
-        elif provider == "anthropic":
-            response = _parse_anthropic_response(data)
-        elif provider == "ollama":
-            response = _parse_ollama_response(data)
+            response = _parse_responses_sse_text(r.text) if provider == "codex" else _parse_responses_text(r.json())
         else:
-            msg = data["choices"][0]["message"]
-            response = msg.get("content") or msg.get("reasoning_content") or ""
+            data = r.json()
+            if provider == "anthropic":
+                response = _parse_anthropic_response(data)
+            elif provider == "ollama":
+                response = _parse_ollama_response(data)
+            else:
+                msg = data["choices"][0]["message"]
+                response = msg.get("content") or msg.get("reasoning_content") or ""
         _set_cached_response(cache_key, response)
         return response
     except Exception:
-        raise HTTPException(502, f"Unexpected schema from {target_url}: {str(data)[:400]}")
+        body = r.text if provider == "codex" else str(locals().get("data", ""))
+        raise HTTPException(502, f"Unexpected schema from {target_url}: {body[:400]}")
 
 
 def _dedupe_candidates(candidates):
@@ -1215,7 +1268,7 @@ async def llm_call_async(
     if _uses_responses_api(url, model):
         target_url = _normalize_responses_url(url)
         h = _provider_headers(provider, headers)
-        payload = _build_responses_payload(model, messages_copy, temperature, max_tokens, codex=(provider == "codex"))
+        payload = _build_responses_payload(model, messages_copy, temperature, max_tokens, stream=(provider == "codex"), codex=(provider == "codex"))
     elif provider == "anthropic":
         target_url = _normalize_anthropic_url(url)
         h = _build_anthropic_headers(headers)
@@ -1271,21 +1324,23 @@ async def llm_call_async(
                 raise HTTPException(r.status_code, friendly)
             logger.info(f"LLM async call to {target_url} succeeded in {duration:.2f}s (attempt {attempt})")
             _clear_host_dead(target_url)
-            data = r.json()
             try:
                 if _uses_responses_api(url, model):
-                    response = _parse_responses_text(data)
-                elif provider == "anthropic":
-                    response = _parse_anthropic_response(data)
-                elif provider == "ollama":
-                    response = _parse_ollama_response(data)
+                    response = _parse_responses_sse_text(r.text) if provider == "codex" else _parse_responses_text(r.json())
                 else:
-                    msg = data["choices"][0]["message"]
-                    response = msg.get("content") or msg.get("reasoning_content") or ""
+                    data = r.json()
+                    if provider == "anthropic":
+                        response = _parse_anthropic_response(data)
+                    elif provider == "ollama":
+                        response = _parse_ollama_response(data)
+                    else:
+                        msg = data["choices"][0]["message"]
+                        response = msg.get("content") or msg.get("reasoning_content") or ""
                 _set_cached_response(cache_key, response)
                 return response
             except Exception:
-                raise HTTPException(502, f"Unexpected schema from {target_url}: {str(data)[:400]}")
+                body = r.text if provider == "codex" else str(locals().get("data", ""))
+                raise HTTPException(502, f"Unexpected schema from {target_url}: {body[:400]}")
         except (httpx.ConnectError, httpx.ConnectTimeout) as e:
             _cooled = _mark_host_dead(target_url)
             duration = time.time() - start
